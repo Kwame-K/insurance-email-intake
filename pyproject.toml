@@ -1,0 +1,38 @@
+[project]
+name = "insurance-email-intake"
+version = "0.1.0"
+description = "Captures broker emails and forwards them to the underwriting workflow."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.141.1",
+    "httpx2>=2.12.0",
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "uvicorn[standard]>=0.52.4",
+]
+
+[project.scripts]
+insurance-email-intake = "insurance_email_intake.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.0,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.16.6",
+]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

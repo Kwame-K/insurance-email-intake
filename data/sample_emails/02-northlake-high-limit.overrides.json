@@ -1,0 +1,6 @@
+{
+    "mfa_enabled": true,
+    "requested_limit_cad": 3000000,
+    "requested_retention_cad": 25000
+  }
+  
