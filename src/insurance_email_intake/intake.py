@@ -1,6 +1,6 @@
 import json
 import threading
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -19,6 +19,7 @@ from insurance_email_intake.models import (
     ParsedEmail,
 )
 from insurance_email_intake.parser import parse_eml
+from insurance_email_intake.replies import strip_quoted_text
 from insurance_email_intake.store import RecordStore
 
 PENDING_INFORMATION = "PENDING_INFORMATION"
@@ -74,6 +75,51 @@ class EmailIntakeService:
                     "Email already processed; no new submission was made.",
                 )
             return self._submit(email, dict(overrides or {}), document_name)
+
+    def ingest_reply(
+        self, raw: bytes, parent_source_ids: Sequence[str]
+    ) -> IntakeResult | None:
+        """Completes a pending submission from a threaded reply.
+
+        Returns None when no stored submission matches the thread, so the
+        caller can handle the email as a new submission.
+        """
+        try:
+            reply = parse_eml(raw, self.default_language)
+        except EmptyEmailError as error:
+            return IntakeResult(status=IntakeStatus.REJECTED, message=str(error))
+
+        with self._lock:
+            record = None
+            for source_id in parent_source_ids:
+                record = self.store.get(source_id)
+                if record is not None:
+                    break
+            if record is None:
+                return None
+            parent_id = record.email.source_id
+            if record.workflow_status != PENDING_INFORMATION:
+                return IntakeResult(
+                    status=IntakeStatus.REJECTED,
+                    source_id=parent_id,
+                    workflow_status=record.workflow_status,
+                    message="This submission is no longer awaiting information.",
+                )
+            new_text = strip_quoted_text(reply.body)
+            if not new_text:
+                return IntakeResult(
+                    status=IntakeStatus.REJECTED,
+                    source_id=parent_id,
+                    workflow_status=record.workflow_status,
+                    message="The reply contains no new text.",
+                )
+            merged = record.email.model_copy(
+                update={
+                    "body": f"{record.email.body}\n\n{new_text}",
+                    "content": f"{record.email.content}\n\n{new_text}",
+                }
+            )
+            return self._submit(merged, record.overrides, record.document_name)
 
     def complete(self, source_id: str, overrides: Mapping[str, Any]) -> IntakeResult:
         with self._lock:

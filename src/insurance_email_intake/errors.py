@@ -12,3 +12,11 @@ class NotCompletableError(ValueError):
 
 class UnderwritingUnavailableError(RuntimeError):
     """The underwriting service could not be reached or returned an error."""
+
+
+class MailboxError(RuntimeError):
+    """The mailbox could not be read."""
+
+
+class ReplyError(Exception):
+    """Raised when a reply email cannot be built or sent."""

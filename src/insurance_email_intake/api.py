@@ -1,8 +1,7 @@
 import logging
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
-from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -14,8 +13,11 @@ from pydantic import BaseModel, Field
 from insurance_email_intake.client import HTTPUnderwritingClient
 from insurance_email_intake.errors import NotCompletableError, RecordNotFoundError
 from insurance_email_intake.intake import EmailIntakeService
+from insurance_email_intake.mailbox import IMAPMailbox
 from insurance_email_intake.models import IntakeRecord, IntakeResult, IntakeStatus
 from insurance_email_intake.parser import build_eml
+from insurance_email_intake.poller import MailboxPoller
+from insurance_email_intake.responder import ReplyPort, SMTPResponder
 from insurance_email_intake.settings import Settings, get_settings
 from insurance_email_intake.store import SOURCE_ID_PATTERN, RecordStore
 
@@ -55,6 +57,42 @@ def build_service(settings: Settings) -> EmailIntakeService:
     )
 
 
+def build_responder(settings: Settings) -> ReplyPort | None:
+    if not settings.smtp_reply_enabled:
+        return None
+    return SMTPResponder(
+        host=settings.smtp_host,
+        port=settings.smtp_port,
+        user=settings.imap_user,
+        password=settings.imap_password.get_secret_value(),
+        language=settings.reply_language,
+        timeout_seconds=settings.smtp_timeout_seconds,
+    )
+
+
+def build_poller(
+    settings: Settings,
+    service: EmailIntakeService,
+) -> MailboxPoller | None:
+    if not settings.imap_enabled:
+        return None
+    mailbox = IMAPMailbox(
+        host=settings.imap_host,
+        port=settings.imap_port,
+        user=settings.imap_user,
+        password=settings.imap_password.get_secret_value(),
+        folder=settings.imap_folder,
+    )
+    return MailboxPoller(
+        mailbox,
+        service,
+        settings.allowed_senders,
+        settings.imap_max_message_bytes,
+        settings.imap_max_messages_per_cycle,
+        responder=build_responder(settings),
+    )
+
+
 def _respond(result: IntakeResult) -> JSONResponse:
     return JSONResponse(
         status_code=_STATUS_CODES[result.status],
@@ -62,59 +100,77 @@ def _respond(result: IntakeResult) -> JSONResponse:
     )
 
 
-def _watch_loop(
-    service: EmailIntakeService,
-    inbox_dir: Path,
+def _run_periodically(
+    name: str,
+    action: Callable[[], list[IntakeResult]],
     interval_seconds: float,
     stop: threading.Event,
 ) -> None:
     while not stop.is_set():
         try:
-            for result in service.scan_inbox(inbox_dir):
+            for result in action():
                 if result.status is not IntakeStatus.DUPLICATE:
                     logger.info(
-                        "Inbox: %s %s -> %s",
+                        "%s: %s %s -> %s",
+                        name,
                         result.status,
                         result.source_id,
                         result.workflow_status or result.message,
                     )
         except Exception:
-            logger.exception("Inbox scan failed.")
+            logger.exception("%s cycle failed.", name)
         stop.wait(interval_seconds)
 
 
 def create_app(
     service: EmailIntakeService | None = None,
     settings: Settings | None = None,
+    poller: MailboxPoller | None = None,
 ) -> FastAPI:
     logging.basicConfig(level=logging.INFO)
     resolved_settings = settings or get_settings()
     resolved_service = service or build_service(resolved_settings)
+    resolved_poller = poller or build_poller(resolved_settings, resolved_service)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        stop = threading.Event()
-        thread: threading.Thread | None = None
+        jobs: list[tuple[str, Callable[[], list[IntakeResult]], float]] = []
         if resolved_settings.watch_enabled:
-            thread = threading.Thread(
-                target=_watch_loop,
-                args=(
-                    resolved_service,
-                    resolved_settings.inbox_dir,
+            jobs.append(
+                (
+                    "inbox",
+                    lambda: resolved_service.scan_inbox(resolved_settings.inbox_dir),
                     resolved_settings.watch_interval_seconds,
-                    stop,
-                ),
+                )
+            )
+        if resolved_poller is not None:
+            jobs.append(
+                (
+                    "mailbox",
+                    resolved_poller.poll_once,
+                    resolved_settings.imap_poll_interval_seconds,
+                )
+            )
+
+        stop = threading.Event()
+        threads = [
+            threading.Thread(
+                target=_run_periodically,
+                args=(name, action, interval, stop),
                 daemon=True,
             )
+            for name, action, interval in jobs
+        ]
+        for thread in threads:
             thread.start()
         yield
         stop.set()
-        if thread is not None:
+        for thread in threads:
             thread.join(timeout=5)
 
     app = FastAPI(
         title="Insurance Email Intake API",
-        version="0.1.0",
+        version="0.2.0",
         description="Captures broker emails and forwards them to underwriting.",
         lifespan=lifespan,
     )
@@ -184,5 +240,14 @@ def create_app(
     @app.post("/v1/inbox/scan", summary="Process the inbox folder once")
     def scan_inbox() -> list[IntakeResult]:
         return resolved_service.scan_inbox(resolved_settings.inbox_dir)
+
+    @app.post("/v1/mailbox/poll", summary="Read the IMAP mailbox once")
+    def poll_mailbox() -> list[IntakeResult]:
+        if resolved_poller is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Mailbox polling is not enabled (IMAP_ENABLED=false).",
+            )
+        return resolved_poller.poll_once()
 
     return app

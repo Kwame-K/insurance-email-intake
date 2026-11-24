@@ -5,7 +5,6 @@ from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import getaddresses, make_msgid
 from html.parser import HTMLParser
-from typing import cast
 
 from insurance_email_intake.errors import EmptyEmailError
 from insurance_email_intake.models import ParsedEmail
